@@ -1,6 +1,7 @@
 package lib
 
 import (
+	"bytes"
 	"context"
 
 	dgbadger "github.com/dgraph-io/badger/v2"
@@ -34,7 +35,7 @@ func chainBadgerDs(path string) (datastore.Batching, error) {
 	return badger.NewDatastore(path, &opts)
 }
 
-func (c *Chain) loadBufferedBstore(ctx context.Context) (*BufferedBlockstore, error) {
+func (c *Chain) LoadBufferedBstore(ctx context.Context) (*BufferedBlockstore, error) {
 	if c.cachedBs != nil {
 		return c.cachedBs, nil
 	}
@@ -45,7 +46,7 @@ func (c *Chain) loadBufferedBstore(ctx context.Context) (*BufferedBlockstore, er
 
 // LoadCborStore loads the ~/.lotus chain datastore for chain traversal and state loading
 func (c *Chain) LoadCborStore(ctx context.Context) (cbornode.IpldStore, error) {
-	bs, err := c.loadBufferedBstore(ctx)
+	bs, err := c.LoadBufferedBstore(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +54,7 @@ func (c *Chain) LoadCborStore(ctx context.Context) (cbornode.IpldStore, error) {
 }
 
 func (c *Chain) LoadToReadOnlyBuffer(ctx context.Context, stateRoot cid.Cid) error {
-	bs, err := c.loadBufferedBstore(ctx)
+	bs, err := c.LoadBufferedBstore(ctx)
 	if err != nil {
 		return err
 	}
@@ -61,7 +62,7 @@ func (c *Chain) LoadToReadOnlyBuffer(ctx context.Context, stateRoot cid.Cid) err
 }
 
 func (c *Chain) FlushBufferedState(ctx context.Context, stateRoot cid.Cid) error {
-	bs, err := c.loadBufferedBstore(ctx)
+	bs, err := c.LoadBufferedBstore(ctx)
 	if err != nil {
 		return err
 	}
@@ -73,15 +74,32 @@ type ChainStateIterator struct {
 	bs         blockstore.Blockstore
 	currBlock  *types.BlockHeader
 	currParent *types.BlockHeader
+	currState  *types.StateRoot
 }
 
 type IterVal struct {
 	Height int64
-	State  cid.Cid
+	State  *types.StateRoot
+}
+
+func DecodeStateRoot(bs blockstore.Blockstore, c cid.Cid) (*types.StateRoot, error) {
+	var root types.StateRoot
+	// Try loading as a new-style state-tree (version/actors tuple).
+	raw, err := bs.Get(c)
+	if err != nil {
+		return nil, err
+	}
+	// assume we have a v0 stat tree.
+	if root.UnmarshalCBOR(bytes.NewReader(raw.RawData())) != nil {
+		// We failed to decode as the new version, must be an old version.
+		root.Actors = c
+		root.Version = types.StateTreeVersion0
+	}
+	return &root, nil
 }
 
 func (c *Chain) NewChainStateIterator(ctx context.Context, tipCid cid.Cid) (*ChainStateIterator, error) {
-	bs, err := c.loadBufferedBstore(ctx)
+	bs, err := c.LoadBufferedBstore(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -100,9 +118,15 @@ func (c *Chain) NewChainStateIterator(ctx context.Context, tipCid cid.Cid) (*Cha
 		return nil, err
 	}
 
+	stateRoot, err := DecodeStateRoot(bs, blk.ParentStateRoot)
+	if err != nil {
+		return nil, err
+	}
+
 	return &ChainStateIterator{
 		currBlock:  blk,
 		currParent: parent,
+		currState:  stateRoot,
 		bs:         bs,
 	}, nil
 }
@@ -117,7 +141,7 @@ func (it *ChainStateIterator) Done() bool {
 // Return the parent state root and parent height of the current block
 func (it *ChainStateIterator) Val() IterVal {
 	return IterVal{
-		State:  it.currBlock.ParentStateRoot,
+		State:  it.currState,
 		Height: int64(it.currParent.Height),
 	}
 }
@@ -133,6 +157,12 @@ func (it *ChainStateIterator) Step(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+
+	it.currState, err = DecodeStateRoot(it.bs, parent.ParentStateRoot)
+	if err != nil {
+		return err
+	}
+
 	it.currBlock = parent
 	return err
 }

@@ -2,12 +2,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"sort"
 	"strconv"
@@ -16,11 +16,15 @@ import (
 
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
+	"github.com/filecoin-project/go-state-types/rt"
 	"github.com/filecoin-project/lotus/chain/types"
 	adt0 "github.com/filecoin-project/specs-actors/actors/util/adt"
 	builtin2 "github.com/filecoin-project/specs-actors/v2/actors/builtin"
-	migration2 "github.com/filecoin-project/specs-actors/v2/actors/migration"
+	migration2 "github.com/filecoin-project/specs-actors/v2/actors/migration/nv4"
 	states2 "github.com/filecoin-project/specs-actors/v2/actors/states"
+	builtin3 "github.com/filecoin-project/specs-actors/v3/actors/builtin"
+	migration3 "github.com/filecoin-project/specs-actors/v3/actors/migration/nv10"
+	states3 "github.com/filecoin-project/specs-actors/v3/actors/states"
 	cid "github.com/ipfs/go-cid"
 	cbornode "github.com/ipfs/go-ipld-cbor"
 	"github.com/urfave/cli/v2"
@@ -29,10 +33,36 @@ import (
 	"github.com/zenground0/ent/lib"
 )
 
+type myLogger struct{}
+
+func (myLogger) Log(level rt.LogLevel, msg string, args ...interface{}) {
+	levelStr := "UNKNOWN"
+	switch level {
+	case rt.DEBUG:
+		levelStr = "DEBUG"
+	case rt.INFO:
+		levelStr = "INFO"
+	case rt.WARN:
+		levelStr = "WARN"
+	case rt.ERROR:
+		levelStr = "ERROR"
+	}
+	fmt.Printf(levelStr+": "+msg, args...)
+}
+
 var migrateCmd = &cli.Command{
 	Name:        "migrate",
-	Description: "migrate a filecoin v1 state root to v2",
+	Description: "migrate a filecoin state root",
 	Subcommands: []*cli.Command{
+		{
+			Name:   "version",
+			Usage:  "the filecoin state root version to migrate",
+			Action: runMigrateOneCmd,
+			Flags: []cli.Flag{
+				&cli.StringFlag{Name: "preload"},
+				&cli.BoolFlag{Name: "validate"},
+			},
+		},
 		{
 			Name:   "one",
 			Usage:  "migrate a single state tree",
@@ -97,18 +127,6 @@ var infoCmd = &cli.Command{
 	},
 }
 
-var exportCmd = &cli.Command{
-	Name:        "export",
-	Description: "export high-cardinality collections",
-	Subcommands: []*cli.Command{
-		{
-			Name:        "sectors",
-			Description: "exports all on-chain sectors",
-			Action:      runExportSectorsCmd,
-		},
-	},
-}
-
 func main() {
 	// pprof server
 	go func() {
@@ -128,7 +146,6 @@ func main() {
 			migrateCmd,
 			validateCmd,
 			infoCmd,
-			exportCmd,
 		},
 	}
 	sort.Sort(cli.CommandsByName(app.Commands))
@@ -150,7 +167,7 @@ func runMigrateOneCmd(c *cli.Context) error {
 		return err
 	}
 	defer cleanUp()
-	stateRootIn, err := cid.Decode(c.Args().First())
+	stateRootInCid, err := cid.Decode(c.Args().First())
 	if err != nil {
 		return err
 	}
@@ -164,26 +181,40 @@ func runMigrateOneCmd(c *cli.Context) error {
 	preloadStr := c.String("preload")
 	maybePreload(c.Context, &chn, preloadStr)
 
+	// Decode the state root.
+	bs, err := chn.LoadBufferedBstore(c.Context)
+	if err != nil {
+		return err
+	}
+	stateRootIn, err := lib.DecodeStateRoot(bs, stateRootInCid)
+	if err != nil {
+		return err
+	}
+
 	// Migrate State
 	store, err := chn.LoadCborStore(c.Context)
 	if err != nil {
 		return err
 	}
+
 	start := time.Now()
-	stateRootOut, err := migration2.MigrateStateTree(c.Context, store, stateRootIn, height, migration2.DefaultConfig())
+	stateRootOut, err := migrateOne(c.Context, store, height, stateRootIn)
+	if err != nil {
+		return err
+	}
 	duration := time.Since(start)
 	if err != nil {
 		return err
 	}
-	fmt.Printf("%s => %s -- %v\n", stateRootIn, stateRootOut, duration)
+	fmt.Printf("%s => %s -- %v\n", stateRootIn.Actors, stateRootOut.Actors, duration)
 
 	// Measure flush time
 	writeStart := time.Now()
-	if err := chn.FlushBufferedState(c.Context, stateRootOut); err != nil {
+	if err := chn.FlushBufferedState(c.Context, stateRootOut.Actors); err != nil {
 		return xerrors.Errorf("failed to flush state tree to disk: %w\n", err)
 	}
 	writeDuration := time.Since(writeStart)
-	fmt.Printf("%s buffer flush time: %v\n", stateRootOut, writeDuration)
+	fmt.Printf("%s buffer flush time: %v\n", stateRootOut.Actors, writeDuration)
 
 	if c.Bool("validate") {
 		err := validate(c.Context, store, height, stateRootOut)
@@ -193,6 +224,31 @@ func runMigrateOneCmd(c *cli.Context) error {
 	}
 
 	return nil
+}
+
+func migrateOne(ctx context.Context, store cbornode.IpldStore, height abi.ChainEpoch, stateRootIn *types.StateRoot) (*types.StateRoot, error) {
+	var (
+		stateRootOut types.StateRoot
+		err          error
+	)
+	switch stateRootIn.Version {
+	case types.StateTreeVersion0:
+		stateRootOut.Actors, err = migration2.MigrateStateTree(ctx, store, stateRootIn.Actors, height, migration2.DefaultConfig())
+		stateRootOut.Version = types.StateTreeVersion1
+	case types.StateTreeVersion1:
+		stateRootOut.Actors, err = migration3.MigrateStateTree(ctx, store, stateRootIn.Actors, height, migration3.Config{
+			MaxWorkers:      uint(runtime.NumCPU()),
+			JobQueueSize:    1000,
+			ResultQueueSize: 100,
+		}, myLogger{}, migration3.NewMemMigrationCache())
+		stateRootOut.Version = types.StateTreeVersion2
+	default:
+		err = fmt.Errorf("unsupported version: %d", stateRootIn.Version)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &stateRootOut, nil
 }
 
 func runMigrateChainCmd(c *cli.Context) error {
@@ -227,19 +283,19 @@ func runMigrateChainCmd(c *cli.Context) error {
 		if k == 0 || val.Height%int64(k) == int64(0) { // skip every k epochs
 			start := time.Now()
 			height := abi.ChainEpoch(val.Height)
-			stateRootOut, err := migration2.MigrateStateTree(c.Context, store, val.State, height, migration2.DefaultConfig())
+			stateRootOut, err := migrateOne(c.Context, store, height, val.State)
 			duration := time.Since(start)
 			if err != nil {
-				fmt.Printf("%d -- %s => %s !! %v\n", val.Height, val.State, stateRootOut, err)
+				fmt.Printf("%d -- %s => %s !! %v\n", val.Height, val.State.Actors, stateRootOut.Actors, err)
 			} else {
-				fmt.Printf("%d -- %s => %s -- %v\n", val.Height, val.State, stateRootOut, duration)
+				fmt.Printf("%d -- %s => %s -- %v\n", val.Height, val.State.Actors, stateRootOut.Actors, duration)
 			}
 			writeStart := time.Now()
-			if err := chn.FlushBufferedState(c.Context, stateRootOut); err != nil {
-				fmt.Printf("%s buffer flush failed: %s\n", err, stateRootOut)
+			if err := chn.FlushBufferedState(c.Context, stateRootOut.Actors); err != nil {
+				fmt.Printf("%s buffer flush failed: %s\n", err, stateRootOut.Actors)
 			}
 			writeDuration := time.Since(writeStart)
-			fmt.Printf("%s buffer flush time: %v\n", stateRootOut, writeDuration)
+			fmt.Printf("%s buffer flush time: %v\n", stateRootOut.Actors, writeDuration)
 
 			// Optional Post-Migration State Validation
 			if c.Bool("validate") {
@@ -267,7 +323,7 @@ func runValidateCmd(c *cli.Context) error {
 	}
 	defer cleanUp()
 
-	stateRoot, err := cid.Decode(c.Args().First())
+	stateRootCid, err := cid.Decode(c.Args().First())
 	if err != nil {
 		return err
 	}
@@ -278,6 +334,16 @@ func runValidateCmd(c *cli.Context) error {
 	height := abi.ChainEpoch(int64(hRaw))
 	chn := lib.Chain{}
 	store, err := chn.LoadCborStore(c.Context)
+	if err != nil {
+		return err
+	}
+
+	// Decode the state root.
+	bs, err := chn.LoadBufferedBstore(c.Context)
+	if err != nil {
+		return err
+	}
+	stateRoot, err := lib.DecodeStateRoot(bs, stateRootCid)
 	if err != nil {
 		return err
 	}
@@ -313,7 +379,7 @@ func runRootsCmd(c *cli.Context) error {
 	}
 	// Output roots
 	for _, val := range roots {
-		fmt.Printf("Epoch %d: %s \n", val.Height, val.State)
+		fmt.Printf("Epoch %d: %s \n", val.Height, val.State.Actors)
 	}
 	return nil
 }
@@ -386,7 +452,7 @@ func runHAMTSizeCmd(c *cli.Context) error {
 	if !c.Args().Present() {
 		return xerrors.Errorf("not enough args, need state root")
 	}
-	stateRootIn, err := cid.Decode(c.Args().First())
+	stateRootInCid, err := cid.Decode(c.Args().First())
 	if err != nil {
 		return err
 	}
@@ -395,23 +461,13 @@ func runHAMTSizeCmd(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	tree, err := loadStateTree(c.Context, store, stateRootIn)
-	if err != nil {
-		return err
-	}
-	return lib.PrintHAMTSizes(c.Context, store, tree)
-}
 
-func runExportSectorsCmd(c *cli.Context) error {
-	if !c.Args().Present() {
-		return xerrors.Errorf("not enough args, need state root")
-	}
-	stateRootIn, err := cid.Decode(c.Args().First())
+	// Decode the state root.
+	bs, err := chn.LoadBufferedBstore(c.Context)
 	if err != nil {
 		return err
 	}
-	chn := lib.Chain{}
-	store, err := chn.LoadCborStore(c.Context)
+	stateRootIn, err := lib.DecodeStateRoot(bs, stateRootInCid)
 	if err != nil {
 		return err
 	}
@@ -420,29 +476,7 @@ func runExportSectorsCmd(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-
-	sectors, err := lib.ExportSectors(c.Context, adt0.WrapStore(c.Context, store), tree)
-	if err != nil {
-		return err
-	}
-
-	// Print JSON representation of sector infos, one per line.
-	keepGoing := true
-	for keepGoing {
-		sinfo, ok := <-sectors
-		j, err := json.Marshal(sinfo)
-		if err != nil {
-			return err
-		}
-		if _, err = os.Stdout.Write(j); err != nil {
-			return err
-		}
-		if _, err = os.Stdout.Write([]byte{'\n'}); err != nil {
-			return err
-		}
-		keepGoing = ok
-	}
-	return nil
+	return lib.PrintHAMTSizes(c.Context, store, tree)
 }
 
 /* Helpers */
@@ -489,34 +523,57 @@ func maybePreload(ctx context.Context, chn *lib.Chain, preloadStr string) error 
 	return err
 }
 
-func validate(ctx context.Context, store cbornode.IpldStore, priorEpoch abi.ChainEpoch, stateRoot cid.Cid) error {
-	tree, err := loadStateTree(ctx, store, stateRoot)
-	if err != nil {
-		return xerrors.Errorf("failed to load tree: %w", err)
-	}
-	expectedBalance := builtin2.TotalFilecoin
-	start := time.Now()
-	acc, err := states2.CheckStateInvariants(tree, expectedBalance, priorEpoch)
-	duration := time.Since(start)
-	if err != nil {
-		return xerrors.Errorf("failed to check state invariants", err)
-	}
-	if acc.IsEmpty() {
-		fmt.Printf("Validation: %s -- no errors -- %v\n", stateRoot, duration)
-	} else {
-		fmt.Printf("Validation: %s -- with errors -- %v\n%s\n", stateRoot, duration, strings.Join(acc.Messages(), "\n"))
+func validate(ctx context.Context, store cbornode.IpldStore, priorEpoch abi.ChainEpoch, stateRoot *types.StateRoot) error {
+	adtStore := adt0.WrapStore(ctx, store)
+	switch stateRoot.Version {
+	case types.StateTreeVersion1:
+		expectedBalance := builtin2.TotalFilecoin
+		tree, err := states2.LoadTree(adtStore, stateRoot.Actors)
+		if err != nil {
+			return xerrors.Errorf("failed to load tree: %w", err)
+		}
+		start := time.Now()
+		acc, err := states2.CheckStateInvariants(tree, expectedBalance, priorEpoch)
+		if err != nil {
+			return xerrors.Errorf("failed to check state invariants", err)
+		}
+		duration := time.Since(start)
+		if acc.IsEmpty() {
+			fmt.Printf("Validation: %s -- no errors -- %v\n", stateRoot.Actors, duration)
+		} else {
+			fmt.Printf("Validation: %s -- with errors -- %v\n%s\n", stateRoot.Actors, duration, strings.Join(acc.Messages(), "\n"))
+		}
+	case types.StateTreeVersion2:
+		expectedBalance := builtin3.TotalFilecoin
+		tree, err := states3.LoadTree(adtStore, stateRoot.Actors)
+		if err != nil {
+			return xerrors.Errorf("failed to load tree: %w", err)
+		}
+		start := time.Now()
+		acc, err := states3.CheckStateInvariants(tree, expectedBalance, priorEpoch)
+		if err != nil {
+			return xerrors.Errorf("failed to check state invariants", err)
+		}
+		duration := time.Since(start)
+		if acc.IsEmpty() {
+			fmt.Printf("Validation: %s -- no errors -- %v\n", stateRoot.Actors, duration)
+		} else {
+			fmt.Printf("Validation: %s -- with errors -- %v\n%s\n", stateRoot.Actors, duration, strings.Join(acc.Messages(), "\n"))
+		}
+	default:
+		return fmt.Errorf("unsupported state tree version %d", stateRoot.Version)
 	}
 	return nil
 }
 
-func loadStateTree(ctx context.Context, store cbornode.IpldStore, stateRoot cid.Cid) (*states2.Tree, error) {
+func loadStateTree(ctx context.Context, store cbornode.IpldStore, stateRoot *types.StateRoot) (lib.StateTree, error) {
 	adtStore := adt0.WrapStore(ctx, store)
-	var treeTop types.StateRoot
-	err := store.Get(ctx, stateRoot, &treeTop)
-	if err != nil {
-		return nil, err
+	switch stateRoot.Version {
+	case types.StateTreeVersion1:
+		return states2.LoadTree(adtStore, stateRoot.Actors)
+	case types.StateTreeVersion2:
+		return states2.LoadTree(adtStore, stateRoot.Actors)
+	default:
+		return nil, fmt.Errorf("unsupported state tree version %d", stateRoot.Version)
 	}
-	_, _ = fmt.Fprintf(os.Stderr, "State root version: %v\n", treeTop.Version)
-	tree, err := states2.LoadTree(adtStore, treeTop.Actors)
-	return tree, nil
 }

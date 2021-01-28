@@ -10,7 +10,6 @@ import (
 	"github.com/filecoin-project/specs-actors/v2/actors/builtin/market"
 	"github.com/filecoin-project/specs-actors/v2/actors/builtin/power"
 	"github.com/filecoin-project/specs-actors/v2/actors/builtin/verifreg"
-	states2 "github.com/filecoin-project/specs-actors/v2/actors/states"
 	"github.com/filecoin-project/specs-actors/v2/actors/util/adt"
 	cid "github.com/ipfs/go-cid"
 	cbornode "github.com/ipfs/go-ipld-cbor"
@@ -19,7 +18,7 @@ import (
 	"golang.org/x/xerrors"
 )
 
-func PrintHAMTSizes(ctx context.Context, store cbornode.IpldStore, tree *states2.Tree) error {
+func PrintHAMTSizes(ctx context.Context, store cbornode.IpldStore, tree StateTree) error {
 	// Init
 	initActor, found, err := tree.GetActor(builtin.InitActorAddr)
 	if !found {
