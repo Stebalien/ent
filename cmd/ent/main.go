@@ -55,15 +55,6 @@ var migrateCmd = &cli.Command{
 	Description: "migrate a filecoin state root",
 	Subcommands: []*cli.Command{
 		{
-			Name:   "version",
-			Usage:  "the filecoin state root version to migrate",
-			Action: runMigrateOneCmd,
-			Flags: []cli.Flag{
-				&cli.StringFlag{Name: "preload"},
-				&cli.BoolFlag{Name: "validate"},
-			},
-		},
-		{
 			Name:   "one",
 			Usage:  "migrate a single state tree",
 			Action: runMigrateOneCmd,
